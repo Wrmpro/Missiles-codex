@@ -1,0 +1,30 @@
+"""Shared configuration for the Missiles! AI pilot."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+
+MISSILE_ANGULAR_MAX_SPEED = 180.0
+MISSILE_ANGULAR_ACCELERATION = 25.0
+MISSILE_ANGULAR_DRAG = 2.5
+MISSILE_BASE_SPEED = 200.0
+PLAYER_SPEED = 300.0
+TEMPLATE_MATCH_THRESHOLD = 0.65
+TRACK_MAX_AGE = 12
+PREDICTION_DT = 0.033
+PREDICTION_HORIZON = 2.0
+PREDICTION_STEPS = int(PREDICTION_HORIZON / PREDICTION_DT)
+APF_ETA = 1000.0
+APF_D0 = 200.0
+DANGER_CRITICAL = 0.8
+DANGER_MODERATE = 0.4
+TARGET_FPS = 30
+GRID_RESOLUTION = 15
+
+MONITOR_BOUNDS = {"top": 0, "left": 0, "width": 1280, "height": 720}
+JOYSTICK_CENTER = (640, 612)
+JOYSTICK_MAX_RADIUS = 80
+CALIBRATION_FILE = str(BASE_DIR / "calibration.json")
+TEMPLATE_DIR = str(BASE_DIR / "assets" / "templates")

@@ -1,0 +1,21 @@
+{
+  "monitor": {
+    "top": 0,
+    "left": 0,
+    "width": 1920,
+    "height": 1080
+  },
+  "game_rect": {
+    "x": 656,
+    "y": 0,
+    "width": 608,
+    "height": 1080
+  },
+  "joystick_center": [
+    960,
+    918
+  ],
+  "joystick_radius": 55,
+  "color_ranges": {},
+  "templates": {}
+}

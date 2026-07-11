@@ -1,0 +1,7 @@
+numpy>=1.24.0
+opencv-python>=4.8.0
+mss>=9.0.0
+scipy>=1.11.0
+pyautogui>=0.9.54
+pygetwindow>=0.0.9
+pywin32>=306

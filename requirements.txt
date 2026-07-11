@@ -3,5 +3,6 @@ opencv-python>=4.8.0
 mss>=9.0.0
 scipy>=1.11.0
 pyautogui>=0.9.54
-pygetwindow>=0.0.9
-pywin32>=306
+Pillow>=10.0.0
+pygetwindow>=0.0.9; platform_system == "Windows"
+pywin32>=306; platform_system == "Windows"

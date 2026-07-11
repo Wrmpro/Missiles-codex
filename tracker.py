@@ -26,9 +26,16 @@ class Track:
     heading: float = 0.0
     confidence: float = 0.0
     age: int = 0
+    missed_frames: int = 0
     hits: int = 1
+    ax: float = 0.0
+    ay: float = 0.0
+    stability: float = 0.0
     history: List[Tuple[float, float]] = field(default_factory=list)
-    
+
+    @property
+    def speed(self) -> float:
+        return math.hypot(self.vx, self.vy)
 
     def predict(self) -> None:
         """Advance by one frame using a constant velocity model."""
@@ -36,40 +43,33 @@ class Track:
         self.x += self.vx
         self.y += self.vy
         self.age += 1
+        self.missed_frames += 1
+        self.confidence *= 0.97
         self.history.append((self.x, self.y))
         self.history = self.history[-20:]
 
-    # In tracker.py, add to Track class:
-    def is_valid_player(self):
-        """Check if this track is a valid player track."""
-        if len(self.history) < 3:
-            return False
-    
-    # Player should be in bottom half of screen
-        if self.y < 400:  # Adjust based on your screen height
-            return False
-    
-    # Player speed should be reasonable (not stationary like a cloud)
-        if self.speed < 10:  # Too slow = probably not player
-            return False
-    
-        return True
-    
     def update(self, det: Detection) -> None:
         """Update this track with an assigned detection."""
 
         alpha = 0.4
         new_vx = det.x - self.x
         new_vy = det.y - self.y
+        prev_vx, prev_vy = self.vx, self.vy
         self.vx = alpha * new_vx + (1.0 - alpha) * self.vx
         self.vy = alpha * new_vy + (1.0 - alpha) * self.vy
+        self.ax = self.vx - prev_vx
+        self.ay = self.vy - prev_vy
         if abs(self.vx) + abs(self.vy) > 0.01:
             self.heading = math.degrees(math.atan2(self.vy, self.vx))
         self.x = det.x
         self.y = det.y
         self.confidence = det.confidence
         self.age = 0
+        self.missed_frames = 0
         self.hits += 1
+        consistency = 1.0 / (1.0 + math.hypot(self.ax, self.ay))
+        persistence = min(1.0, self.hits / 8.0)
+        self.stability = 0.65 * persistence + 0.35 * consistency
         self.history.append((self.x, self.y))
         self.history = self.history[-20:]
 
@@ -77,7 +77,7 @@ class Track:
     def is_alive(self) -> bool:
         """Return True while the track is still fresh enough to use."""
 
-        return self.age < config.TRACK_MAX_AGE
+        return self.missed_frames < config.TRACK_MAX_AGE
 
 
 class Tracker:
@@ -104,6 +104,43 @@ class Tracker:
         )
         self._next_id += 1
 
+    @staticmethod
+    def _gate(track: Track, det: Detection) -> float:
+        """Distance gate for association, scaled by class and observed speed."""
+
+        base = 70.0 if det.cls == "missile" else 120.0
+        dynamic = min(80.0, track.speed * 1.8)
+        return base + dynamic
+
+    def _is_stable_missile(self, track: Track) -> bool:
+        if not track.is_alive:
+            return False
+        if track.cls != "missile":
+            return False
+        if track.hits < 3:
+            return False
+        if track.confidence < 0.53:
+            return False
+        if track.speed < 0.8:
+            return False
+        if track.speed > 120.0:
+            return False
+        return track.stability >= 0.28
+
+    def stable_tracks(self) -> List[Track]:
+        """Return tracks suitable for planning and prediction."""
+
+        stable: List[Track] = []
+        for track in self.tracks.values():
+            if not track.is_alive:
+                continue
+            if track.cls == "missile":
+                if self._is_stable_missile(track):
+                    stable.append(track)
+            else:
+                stable.append(track)
+        return stable
+
     def update(self, detections: List[Detection]) -> List[Track]:
         """Update tracks and return active tracks."""
 
@@ -121,14 +158,14 @@ class Tracker:
             for i, track in enumerate(track_list):
                 for j, det in enumerate(detections):
                     if track.cls == det.cls:
-                        costs[i, j] = np.hypot(track.x - det.x, track.y - det.y)
+                        distance = float(np.hypot(track.x - det.x, track.y - det.y))
+                        if distance <= self._gate(track, det):
+                            costs[i, j] = distance
             rows, cols = linear_sum_assignment(costs)
-            matched_tracks = set()
             matched_dets = set()
             for row, col in zip(rows, cols):
-                if costs[row, col] <= 120.0:
+                if costs[row, col] < 1e5:
                     track_list[row].update(detections[col])
-                    matched_tracks.add(row)
                     matched_dets.add(col)
             for idx, det in enumerate(detections):
                 if idx not in matched_dets:

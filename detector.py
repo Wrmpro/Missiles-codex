@@ -40,6 +40,7 @@ class CalibratedDetector:
         self.templates: Dict[str, List[Template]] = {
             "player": [],
             "missile": [],
+            "cloud": [],
             "star": [],
             "shield": [],
             "boost": [],
@@ -52,6 +53,8 @@ class CalibratedDetector:
             return "player"
         if re.fullmatch(r"missile\d+\.png", lowered):
             return "missile"
+        if re.fullmatch(r"cloud\d+\.png", lowered) or re.fullmatch(r"menu_cloud\d+.*\.png", lowered):
+            return "cloud"
         if lowered in {"star.png"}:
             return "star"
         if lowered in {"shield_power_up.png", "shield 1.png"}:
@@ -86,13 +89,29 @@ class CalibratedDetector:
         counts = ", ".join(f"{k}={len(v)}" for k, v in self.templates.items())
         print(f"[detector] Loaded templates: {counts}")
 
+    @staticmethod
+    def _extract_peaks(result: np.ndarray, threshold: float, min_distance: int = 6) -> List[Tuple[int, int, float]]:
+        """Return local maxima above threshold to avoid duplicate raw matches."""
+
+        if result.size == 0:
+            return []
+        kernel_size = max(3, 2 * min_distance + 1)
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        maxima = cv2.dilate(result, kernel)
+        mask = (result >= threshold) & np.isclose(result, maxima, atol=1e-6)
+        ys, xs = np.where(mask)
+        peaks = [(int(x), int(y), float(result[y, x])) for x, y in zip(xs, ys)]
+        peaks.sort(key=lambda item: item[2], reverse=True)
+        return peaks[:60]
+
     def _detect_by_template(
         self, gray: np.ndarray, obj_type: str, threshold: Optional[float] = None
     ) -> List[Detection]:
         detections: List[Detection] = []
         class_thresholds = {
-            "player": max(self.threshold, 0.75),
-            "missile": 0.58,
+            "player": max(self.threshold, 0.74),
+            "missile": 0.61,
+            "cloud": 0.63,
             "star": 0.62,
             "shield": 0.62,
             "boost": 0.62,
@@ -116,47 +135,73 @@ class CalibratedDetector:
                 except cv2.error:
                     result = cv2.matchTemplate(gray, resized, cv2.TM_CCOEFF_NORMED)
                 result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
-                ys, xs = np.where(result >= threshold)
-                for x, y in zip(xs, ys):
-                    detections.append(
-                        Detection(obj_type, x + w / 2.0, y + h / 2.0, float(result[y, x]), w, h)
-                    )
+                for x, y, score in self._extract_peaks(result, threshold):
+                    detections.append(Detection(obj_type, x + w / 2.0, y + h / 2.0, score, w, h))
         return detections
 
-    def _nms(self, detections: List[Detection], min_distance: float = 25.0) -> List[Detection]:
+    @staticmethod
+    def _iou(a: Detection, b: Detection) -> float:
+        ax1, ay1 = a.x - a.w / 2.0, a.y - a.h / 2.0
+        ax2, ay2 = a.x + a.w / 2.0, a.y + a.h / 2.0
+        bx1, by1 = b.x - b.w / 2.0, b.y - b.h / 2.0
+        bx2, by2 = b.x + b.w / 2.0, b.y + b.h / 2.0
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0.0:
+            return 0.0
+        union = a.w * a.h + b.w * b.h - inter
+        if union <= 0.0:
+            return 0.0
+        return float(inter / union)
+
+    def _reject_cloud_overlaps(self, missiles: List[Detection], clouds: List[Detection]) -> List[Detection]:
+        """Reject missile candidates that overlap known cloud detections."""
+
         kept: List[Detection] = []
-        for det in sorted(detections, key=lambda d: d.confidence, reverse=True):
-            if all(
-                det.cls != other.cls
-                or np.hypot(det.x - other.x, det.y - other.y) >= min_distance
-                for other in kept
-            ):
-                kept.append(det)
+        for missile in missiles:
+            overlaps_cloud = False
+            for cloud in clouds:
+                if self._iou(missile, cloud) > 0.18:
+                    overlaps_cloud = True
+                    break
+            if not overlaps_cloud:
+                kept.append(missile)
+        return kept
+
+    def _nms(self, detections: List[Detection], iou_threshold: float = 0.35) -> List[Detection]:
+        kept: List[Detection] = []
+        by_class: Dict[str, List[Detection]] = {}
+        for det in detections:
+            by_class.setdefault(det.cls, []).append(det)
+        for cls_dets in by_class.values():
+            for det in sorted(cls_dets, key=lambda d: d.confidence, reverse=True):
+                if all(self._iou(det, other) < iou_threshold for other in kept if other.cls == det.cls):
+                    kept.append(det)
         return kept
 
     def detect(self, frame: np.ndarray, include_classes: Optional[Iterable[str]] = None) -> List[Detection]:
         """Detect all configured object classes in a BGR frame."""
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        detections: List[Detection] = []
-        classes = list(include_classes) if include_classes is not None else list(self.templates)
+        requested = (
+            list(include_classes)
+            if include_classes is not None
+            else [cls for cls in self.templates.keys() if cls != "cloud"]
+        )
+        classes = list(requested)
+        if "missile" in requested and "cloud" not in classes and self.templates.get("cloud"):
+            classes.append("cloud")
+
+        raw: Dict[str, List[Detection]] = {}
         for obj_type in classes:
-            detections.extend(self._detect_by_template(gray, obj_type))
-        return self._nms(detections)
+            raw[obj_type] = self._detect_by_template(gray, obj_type)
 
-    # In your detector.py or tracker.py, add this validation:
+        missiles = raw.get("missile", [])
+        clouds = raw.get("cloud", [])
+        if missiles and clouds:
+            raw["missile"] = self._reject_cloud_overlaps(missiles, clouds)
 
-def _get_player_track(self):
-    players = [t for t in self.tracks.values() 
-               if t.cls == 'player' and t.is_alive]
-    if not players:
-        return None
-    
-    # Filter out false positives (player should be in bottom 60% of screen)
-    valid_players = [p for p in players 
-                     if p.y > self.game_height * 0.4]  # Must be below 40% of screen
-    
-    if not valid_players:
-        return None
-    
-    return max(valid_players, key=lambda t: t.confidence)
+        merged = [det for cls, items in raw.items() for det in items if cls in requested]
+        return self._nms(merged)

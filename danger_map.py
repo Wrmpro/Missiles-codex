@@ -22,6 +22,22 @@ class DangerMap:
         xs = np.arange(self.grid_w, dtype=np.float32) * resolution + resolution / 2.0
         ys = np.arange(self.grid_h, dtype=np.float32) * resolution + resolution / 2.0
         self.xx, self.yy = np.meshgrid(xs, ys)
+        self._previous_grid: np.ndarray | None = None
+        self._temporal_weights = self._build_temporal_weights()
+
+    def _build_temporal_weights(self) -> np.ndarray:
+        """Build deterministic temporal weights with stronger near-future danger."""
+
+        weights = np.exp(-0.08 * np.arange(config.PREDICTION_STEPS, dtype=np.float32))
+        horizons = (0.25, 0.5, 1.0, 2.0, 3.0)
+        emphasis = (1.45, 1.30, 1.15, 1.0, 0.85)
+        for horizon, factor in zip(horizons, emphasis):
+            index = min(config.PREDICTION_STEPS - 1, int(horizon / max(config.PREDICTION_DT, 1e-6)))
+            weights[index:] *= factor
+        max_weight = float(weights.max())
+        if max_weight > 0.0:
+            weights /= max_weight
+        return weights
 
     def compute(
         self,
@@ -36,18 +52,24 @@ class DangerMap:
                 dist = np.hypot(self.xx - mx, self.yy - my)
                 safe_dist = np.maximum(dist, 1.0)
                 influence = safe_dist < config.APF_D0
-                discount = np.exp(-step * 0.08)
+                discount = self._temporal_weights[min(step, len(self._temporal_weights) - 1)]
                 potential = 0.5 * config.APF_ETA * ((1.0 / safe_dist) - (1.0 / config.APF_D0)) ** 2
-                grid += np.where(influence, potential * discount, 0.0)
+                # Increase pressure in the immediate collision cone to improve short-horizon survival.
+                critical_zone = np.where(safe_dist < 140.0, (140.0 - safe_dist) / 140.0, 0.0)
+                grid += np.where(influence, potential * discount, 0.0) + 1.8 * critical_zone * discount
 
         margin = np.minimum.reduce(
             [self.xx, self.yy, self.width - self.xx, self.height - self.yy]
         )
         grid += np.exp(-np.maximum(margin, 0.0) / 40.0) * 0.35
+        if self._previous_grid is not None:
+            # Persist a fraction of prior danger to avoid fast oscillation between local minima.
+            grid = 0.82 * grid + 0.18 * self._previous_grid
         grid = cv2.GaussianBlur(grid, (0, 0), sigmaX=2.0, sigmaY=2.0)
         max_value = float(grid.max())
         if max_value > 0.0:
             grid /= max_value
+        self._previous_grid = grid
         return grid
 
     def potential_at(self, grid: np.ndarray, x: float, y: float) -> float:

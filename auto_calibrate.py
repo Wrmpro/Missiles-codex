@@ -19,7 +19,9 @@ import win32gui
 import win32api
 
 import config
+import calibrate as calib
 from detector import Detection
+from game_state import Action, GameStateMachine, Observation
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.01
@@ -206,30 +208,49 @@ def focus_window(win: Any) -> bool:
 
 
 def calibrate_from_window(win: Any) -> dict[str, Any]:
-    """Save capture and joystick coordinates from the window geometry."""
+    """Detect canvas, joystick and UI with high confidence and persist them.
+
+    Uses the recovered joystick/button templates (via ``calibrate.py``) with a
+    letterbox and Hough fallback, and refuses low-confidence results by tagging
+    them so the caller can retry rather than play blind.
+    """
 
     left, top, width, height = int(win.left), int(win.top), int(win.width), int(win.height)
-    game_rect = (0, 0, width, height)
     try:
         frame = _grab_window_bgr(win)
-        game_rect = detect_game_rect(frame)
+        result = calib.calibrate(frame)
     except Exception as exc:
-        print(f"[calibrate] Could not detect game canvas, using whole window: {exc}")
-    gx, gy, gwid, ghei = game_rect
-    joystick_center = (left + gx + gwid // 2, top + gy + int(ghei * 0.85))
-    joystick_radius = max(55, min(110, int(min(gwid, ghei) * 0.075)))
+        print(f"[calibrate] Calibration failed, using window geometry: {exc}")
+        gx, gy, gwid, ghei = 0, 0, width, height
+        result = calib.CalibrationResult(
+            game_rect=(gx, gy, gwid, ghei),
+            joystick_center=(gwid // 2, int(ghei * 0.85)),
+            joystick_radius=max(config.JOYSTICK_RADIUS_MIN, int(min(gwid, ghei) * 0.09)),
+            confidence=0.0,
+        )
+
+    gx, gy, gwid, ghei = result.game_rect
+    # Convert window-local joystick/UI coordinates into absolute screen space.
+    abs_joystick = (left + result.joystick_center[0], top + result.joystick_center[1])
+    abs_ui = {name: [left + pt[0], top + pt[1]] for name, pt in result.ui.items()}
     data = {
         "monitor": {"top": top, "left": left, "width": width, "height": height},
         "game_rect": {"x": gx, "y": gy, "width": gwid, "height": ghei},
-        "joystick_center": [joystick_center[0], joystick_center[1]],
-        "joystick_radius": joystick_radius,
+        "joystick_center": [abs_joystick[0], abs_joystick[1]],
+        "joystick_radius": int(result.joystick_radius),
+        "confidence": round(float(result.confidence), 3),
+        "sources": {k: round(float(v), 3) for k, v in result.sources.items()},
+        "ui": abs_ui,
         "color_ranges": {},
         "templates": {},
     }
     Path(config.CALIBRATION_FILE).write_text(json.dumps(data, indent=2), encoding="utf-8")
     print(f"[calibrate] Window: left={left} top={top} width={width} height={height}")
     print(f"[calibrate] Game canvas: x={gx} y={gy} width={gwid} height={ghei}")
-    print(f"[calibrate] Joystick center: {joystick_center}, radius={joystick_radius}")
+    print(f"[calibrate] Joystick center: {abs_joystick}, radius={result.joystick_radius}")
+    print(f"[calibrate] Confidence: {result.confidence:.2f} sources={result.sources}")
+    if not result.is_reliable:
+        print("[calibrate] WARNING: calibration confidence is low; will retry before playing.")
     return data
 
 
@@ -456,32 +477,152 @@ def _offset_detections(detections: list[Detection], off_x: int, off_y: int) -> l
     ]
 
 
+def _load_calibration() -> dict[str, Any]:
+    """Load the persisted calibration, or return an empty dict."""
+
+    path = Path(config.CALIBRATION_FILE)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+class _Pilot:
+    """Owns perception/planning/control components and (re)configures them.
+
+    Keeping the components in one object lets the launcher rebuild them cleanly
+    after a (re)calibration (e.g. if the canvas size changed) without leaking
+    stale trackers or danger grids between runs.
+    """
+
+    def __init__(self) -> None:
+        from capture import FrameCapture
+        from controller import PCController
+        from detector import CalibratedDetector
+        from predictor import MissilePredictor
+
+        self.capture = FrameCapture()
+        self.detector = CalibratedDetector()
+        self.predictor = MissilePredictor()
+        self.controller = PCController()
+        self.tracker = None  # type: ignore[assignment]
+        self.danger_map = None
+        self.planner = None
+        self.no_templates = _template_folder_empty()
+        self.confidence = 0.0
+        # Default game rect = whole capture until calibration is applied.
+        self.game_rect = (0, 0, int(self.capture.monitor["width"]), int(self.capture.monitor["height"]))
+        self.apply_calibration()
+
+    def apply_calibration(self) -> None:
+        """Reload calibration.json and reconfigure every component from it."""
+
+        from danger_map import DangerMap
+        from planner import Planner
+        from tracker import Tracker
+
+        data = _load_calibration()
+        monitor = data.get("monitor")
+        if isinstance(monitor, dict):
+            self.capture.set_monitor(monitor)
+        rect = data.get("game_rect")
+        if isinstance(rect, dict) and rect.get("width") and rect.get("height"):
+            self.game_rect = (int(rect["x"]), int(rect["y"]), int(rect["width"]), int(rect["height"]))
+        _, _, gw, gh = self.game_rect
+        self.confidence = float(data.get("confidence", 0.0))
+
+        self.detector.configure(gw, gh)
+        rebuild = (
+            self.danger_map is None
+            or self.danger_map.width != gw
+            or self.danger_map.height != gh
+        )
+        if rebuild:
+            self.danger_map = DangerMap(gw, gh)
+            self.planner = Planner(self.danger_map)
+        # Always start each run with fresh tracks to avoid stale-state drift.
+        self.tracker = Tracker(game_height=gh)
+
+        center = data.get("joystick_center")
+        radius = data.get("joystick_radius")
+        if center and radius:
+            self.controller.update_calibration((int(center[0]), int(center[1])), int(radius))
+
+    def reset_tracks(self) -> None:
+        from tracker import Tracker
+
+        _, _, _, gh = self.game_rect
+        self.tracker = Tracker(game_height=gh)
+
+    def grab_game_frame(self) -> np.ndarray:
+        frame = self.capture.grab()
+        x, y, w, h = self.game_rect
+        h_frame, w_frame = frame.shape[:2]
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(w_frame, x + w), min(h_frame, y + h)
+        if x1 <= x0 or y1 <= y0:
+            return frame
+        return frame[y0:y1, x0:x1]
+
+    def detect(self, game_frame: np.ndarray) -> list[Detection]:
+        """Template detection fused with color fallback for missing classes."""
+
+        detections: list[Detection] = []
+        if not self.no_templates:
+            try:
+                detections = list(self.detector.detect(game_frame))
+            except Exception as exc:  # never let a detection error kill the loop
+                print(f"[ai] Template detection error: {exc}")
+                detections = []
+
+        present = {det.cls for det in detections}
+        if "player" not in present:
+            fallback_player = _fallback_detect_player(game_frame)
+            if fallback_player:
+                detections.append(Detection("player", fallback_player[0], fallback_player[1], 0.45, 40, 40))
+        if "missile" not in present:
+            for mx, my in _fallback_detect_missiles(game_frame):
+                detections.append(Detection("missile", mx, my, 0.4, 18, 18))
+        if not ({"star", "shield", "boost"} & present):
+            detections.extend(_fallback_detect_pickups(game_frame))
+        return detections
+
+    def ui_signals(self, game_frame: np.ndarray) -> tuple[bool, bool]:
+        """Return (gameover_signal, menu_signal) via UI button templates."""
+
+        h, w = game_frame.shape[:2]
+        rect = (0, 0, w, h)
+        template_dir = Path(config.TEMPLATE_DIR)
+        try:
+            play = calib.find_ui_element(
+                game_frame, rect, ("menu_play_button.png", "play_button.png"), template_dir, threshold=0.6
+            )
+            restart = calib.find_ui_element(
+                game_frame, rect, ("restart_button.png", "play_button.png"), template_dir, threshold=0.6
+            )
+        except Exception:
+            return False, False
+        menu_signal = play is not None
+        gameover_signal = restart is not None
+        return gameover_signal, menu_signal
+
+
 def run_ai(max_seconds: Optional[float] = None) -> None:
-    """Run capture, detection, prediction, planning, and joystick control."""
+    """FSM-driven main loop: launch, calibrate, play, detect death, restart."""
 
-    from capture import FrameCapture
-    from controller import PCController
-    from danger_map import DangerMap
-    from detector import CalibratedDetector, Detection
-    from planner import Planner
-    from predictor import MissilePredictor
-    from tracker import Tracker
-
-    capture = FrameCapture()
-    detector = CalibratedDetector()
-    tracker = Tracker()
-    predictor = MissilePredictor()
-    danger_map = DangerMap(capture.monitor["width"], capture.monitor["height"])
-    planner = Planner(danger_map)
-    controller = PCController()
+    pilot = _Pilot()
+    fsm = GameStateMachine()
+    win = find_game_window()
     started_at = time.perf_counter()
+    run_started_at = started_at
     frame_index = 0
     frame_delay = 1.0 / config.TARGET_FPS
-    no_templates = _template_folder_empty()
-    win = find_game_window()
-    print("[ai] Pilot running. Press Ctrl+C to stop.")
-    if no_templates:
-        print("[ai] No PNG templates found; using limited fallback player detection.")
+    last_player_seen = started_at
+    print("[ai] Pilot running (state machine). Press Ctrl+C or F8 to stop.")
+    if pilot.no_templates:
+        print("[ai] No PNG templates found; using limited fallback detection.")
 
     try:
         while True:
@@ -492,62 +633,97 @@ def run_ai(max_seconds: Optional[float] = None) -> None:
                 print(f"[ai] Test duration reached: {max_seconds:.1f}s")
                 break
             loop_start = time.perf_counter()
-            if not is_game_foreground():
-                controller.release()
-                if frame_index % 30 == 0:
-                    print(f"[ai] Real game is not foreground, current foreground: {_foreground_title()!r}")
-                    if win is not None:
-                        focus_window(win)
+            now = loop_start
+
+            obs = Observation(now=now)
+            obs.foreground = is_game_foreground()
+            obs.calibrated = pilot.confidence >= config.CALIBRATION_MIN_CONFIDENCE
+
+            player = None
+            stable_tracks: list = []
+            danger_grid = None
+            if obs.foreground:
+                game_frame = pilot.grab_game_frame()
+                detections = pilot.detect(game_frame)
+                pilot.tracker.update(detections)
+                player = pilot.tracker._get_player_track()
+                stable_tracks = pilot.tracker.stable_tracks()
+                obs.player_present = player is not None
+                if obs.player_present:
+                    last_player_seen = now
+                else:
+                    obs.gameover_signal, obs.menu_signal = pilot.ui_signals(game_frame)
+                    # Robustness: if the player has been gone for a while, treat
+                    # it as a death even when the death-screen template is missed.
+                    if now - last_player_seen > 2.5:
+                        obs.gameover_signal = True
+
+            action = fsm.update(obs)
+
+            if action == Action.FOCUS_WINDOW:
+                pilot.controller.release()
+                if win is None:
+                    win = find_game_window()
+                if win is not None:
+                    focus_window(win)
                 time.sleep(0.10)
-                frame_index += 1
-                continue
 
-            frame = capture.grab()
-            game_frame, (off_x, off_y, _, _) = _crop_to_game(frame)
-            detections: list[Detection] = []
-            if win is not None and frame_index % 60 == 0 and click_red_play_button(win):
-                tracker = Tracker()
-                controller.release()
-                time.sleep(1.0)
-                frame_index += 1
-                continue
+            elif action == Action.CALIBRATE:
+                pilot.controller.release()
+                if win is None:
+                    win = find_game_window()
+                if win is not None and is_game_foreground():
+                    calibrate_from_window(win)
+                    pilot.apply_calibration()
+                    fsm.mark_calibrated(now)
+                    print(f"[ai] Calibrated (confidence={pilot.confidence:.2f}).")
+                elif win is not None:
+                    focus_window(win)
+                time.sleep(0.15)
 
-            fallback_player = _fallback_detect_player(game_frame)
-            if fallback_player:
-                detections.append(
-                    Detection("player", fallback_player[0] + off_x, fallback_player[1] + off_y, 0.5, 40, 40)
-                )
-            for mx, my in _fallback_detect_missiles(game_frame):
-                detections.append(Detection("missile", mx + off_x, my + off_y, 0.4, 18, 18))
-            detections.extend(_offset_detections(_fallback_detect_pickups(game_frame), off_x, off_y))
-            tracks = tracker.update(detections)
-            player = tracker._get_player_track()
-            if player is not None:
-                elapsed = time.perf_counter() - started_at
-                trajectories = predictor.predict_all(tracks, player.x, player.y, elapsed)
-                danger_grid = danger_map.compute(trajectories, (player.x, player.y))
-                dx, dy = planner.plan((player.x, player.y), tracks, danger_grid)
-                controller.send(dx, dy)
-                if frame_index % 10 == 0:
-                    missiles = sum(1 for t in tracks if t.cls == "missile")
-                    danger = danger_map.potential_at(danger_grid, player.x, player.y)
-                    print(
-                        f"[ai] frame={frame_index} player=({player.x:.0f},{player.y:.0f}) "
-                        f"missiles={missiles} danger={danger:.2f} input=({dx:.2f},{dy:.2f}) "
-                        f"capture={capture.capture_ms:.1f}ms"
-                    )
-            else:
-                controller.release()
-                if frame_index % 30 == 0:
-                    print("[ai] Waiting for player detection...")
-                if win is not None and frame_index % 90 == 0:
-                    clicked = click_template_button(
-                        win,
-                        ("restart_button.png", "play_button.png", "menu_play_button.png"),
-                        threshold=0.70,
-                    )
-                    if not clicked:
+            elif action == Action.CLICK_PLAY:
+                pilot.controller.release()
+                pilot.reset_tracks()
+                if win is not None:
+                    if not click_template_button(win, ("menu_play_button.png", "play_button.png"), threshold=0.66):
                         click_red_play_button(win)
+                last_player_seen = now
+                run_started_at = now
+
+            elif action == Action.CLICK_RESTART:
+                pilot.controller.release()
+                pilot.reset_tracks()
+                if win is not None:
+                    if not click_template_button(
+                        win, ("restart_button.png", "play_button.png", "menu_play_button.png"), threshold=0.66
+                    ):
+                        click_red_play_button(win)
+                last_player_seen = now
+                run_started_at = now
+
+            elif action == Action.RUN_AI:
+                if player is not None and pilot.danger_map is not None and pilot.planner is not None:
+                    elapsed = now - run_started_at
+                    trajectories = pilot.predictor.predict_all(stable_tracks, player.x, player.y, elapsed)
+                    danger_grid = pilot.danger_map.compute(trajectories, (player.x, player.y))
+                    dx, dy = pilot.planner.plan((player.x, player.y), stable_tracks, danger_grid)
+                    pilot.controller.send(dx, dy)
+                    if frame_index % 12 == 0:
+                        missiles = sum(1 for t in stable_tracks if t.cls == "missile")
+                        danger = pilot.danger_map.potential_at(danger_grid, player.x, player.y)
+                        print(
+                            f"[ai] {fsm.state.name} player=({player.x:.0f},{player.y:.0f}) "
+                            f"missiles={missiles} danger={danger:.2f} input=({dx:.2f},{dy:.2f}) "
+                            f"phys_conf={pilot.predictor.confidence:.2f} cap={pilot.capture.capture_ms:.1f}ms"
+                        )
+                else:
+                    pilot.controller.release()
+
+            elif action == Action.RELEASE:
+                pilot.controller.release()
+
+            else:  # Action.WAIT
+                time.sleep(0.05)
 
             frame_index += 1
             sleep_for = frame_delay - (time.perf_counter() - loop_start)
@@ -556,7 +732,7 @@ def run_ai(max_seconds: Optional[float] = None) -> None:
     except KeyboardInterrupt:
         print("\n[ai] Stop requested.")
     finally:
-        controller.release()
+        pilot.controller.release()
         print("[ai] Joystick released.")
 
 
@@ -585,9 +761,10 @@ def main() -> None:
     if not focus_window(win):
         print("[error] Game window is not foreground. Click the game once and run again.")
         sys.exit(1)
+    # Prime a first calibration so the state machine can start immediately; the
+    # machine re-verifies and (re)clicks play/restart itself from here on.
     calibrate_from_window(win)
-    click_start_button(win)
-    print("[main] Starting AI in 3 seconds...")
+    print("[main] Starting AI state machine in 3 seconds...")
     for value in (3, 2, 1):
         print(f"  {value}")
         time.sleep(1)

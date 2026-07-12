@@ -127,6 +127,18 @@ class MissilePredictor:
     def __init__(self) -> None:
         self._estimator = PhysicsEstimator()
 
+    @property
+    def confidence(self) -> float:
+        """Confidence in the online physics estimate, in [0, 1]."""
+
+        return float(np.clip(self._estimator.confidence, 0.0, 1.0))
+
+    def physics_summary(self) -> Tuple[float, float, float, float]:
+        """Return (base_speed, angular_max, angular_acc, confidence)."""
+
+        base_speed, angular_max, angular_acc = self._estimator.parameters()
+        return base_speed, angular_max, angular_acc, self.confidence
+
     def get_speed_multiplier(self, elapsed_seconds: float) -> float:
         """Return the game's speed multiplier for the elapsed run time."""
 

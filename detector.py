@@ -1,4 +1,14 @@
-"""Template based object detector for Missiles! sprites."""
+"""Template based object detector for Missiles! sprites.
+
+The recovered Unity sprites are stored at their native (large) authoring
+resolution, but they render *small* in the captured game window. Matching them
+at ~1.0x scale (as the original code did) essentially never fires on real
+gameplay frames. This detector instead builds a physically-plausible scale
+pyramid per class from the game-canvas size, restricts the search to the
+gameplay region of interest, uses cloud sprites as *negative* evidence so
+clouds are never mistaken for missiles, and caps detections per class to keep
+false positives from flooding the tracker.
+"""
 
 from __future__ import annotations
 
@@ -45,7 +55,18 @@ class CalibratedDetector:
             "shield": [],
             "boost": [],
         }
+        # Canvas short edge in px; drives the plausible-size pyramid. Set via
+        # ``configure`` once calibration is known. A sane default keeps the
+        # detector usable before calibration.
+        self._canvas_short = 500.0
         self._load_templates(Path(template_dir))
+
+    def configure(self, canvas_w: int, canvas_h: int) -> None:
+        """Tell the detector the game-canvas size so it can scale templates."""
+
+        short = float(min(max(canvas_w, 1), max(canvas_h, 1)))
+        if short > 20:
+            self._canvas_short = short
 
     def _class_from_name(self, name: str) -> Optional[str]:
         lowered = name.lower()
@@ -89,6 +110,15 @@ class CalibratedDetector:
         counts = ", ".join(f"{k}={len(v)}" for k, v in self.templates.items())
         print(f"[detector] Loaded templates: {counts}")
 
+    def _target_long_edges(self, obj_type: str) -> List[int]:
+        """Plausible on-screen long-edge sizes (px) for a class."""
+
+        low_f, high_f = config.OBJECT_SIZE_FRACTIONS.get(obj_type, (0.04, 0.14))
+        low = self._canvas_short * low_f
+        high = self._canvas_short * high_f
+        steps = max(2, config.DETECTION_SCALE_STEPS)
+        return [int(round(v)) for v in np.linspace(low, high, steps)]
+
     @staticmethod
     def _extract_peaks(result: np.ndarray, threshold: float, min_distance: int = 6) -> List[Tuple[int, int, float]]:
         """Return local maxima above threshold to avoid duplicate raw matches."""
@@ -109,17 +139,22 @@ class CalibratedDetector:
     ) -> List[Detection]:
         detections: List[Detection] = []
         class_thresholds = {
-            "player": max(self.threshold, 0.74),
-            "missile": 0.61,
-            "cloud": 0.63,
-            "star": 0.62,
-            "shield": 0.62,
-            "boost": 0.62,
+            "player": max(self.threshold, 0.72),
+            "missile": 0.60,
+            "cloud": 0.60,
+            "star": 0.60,
+            "shield": 0.60,
+            "boost": 0.60,
         }
         threshold = threshold if threshold is not None else class_thresholds.get(obj_type, self.threshold)
+        target_edges = self._target_long_edges(obj_type)
         for tmpl, mask, tw, th in self.templates.get(obj_type, []):
-            for scale in (0.8, 1.0, 1.2):
-                w, h = max(4, int(tw * scale)), max(4, int(th * scale))
+            long_edge = max(tw, th)
+            for target in target_edges:
+                if target < 6:
+                    continue
+                scale = target / float(long_edge)
+                w, h = max(4, int(round(tw * scale))), max(4, int(round(th * scale)))
                 if w >= gray.shape[1] or h >= gray.shape[0]:
                     continue
                 resized = cv2.resize(tmpl, (w, h), interpolation=cv2.INTER_AREA)
@@ -181,10 +216,42 @@ class CalibratedDetector:
                     kept.append(det)
         return kept
 
-    def detect(self, frame: np.ndarray, include_classes: Optional[Iterable[str]] = None) -> List[Detection]:
-        """Detect all configured object classes in a BGR frame."""
+    def _cap_per_class(self, detections: List[Detection]) -> List[Detection]:
+        """Keep only the most confident N detections per class."""
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        by_class: Dict[str, List[Detection]] = {}
+        for det in detections:
+            by_class.setdefault(det.cls, []).append(det)
+        capped: List[Detection] = []
+        for cls, items in by_class.items():
+            limit = config.MAX_DETECTIONS.get(cls)
+            items.sort(key=lambda d: d.confidence, reverse=True)
+            capped.extend(items[:limit] if limit is not None else items)
+        return capped
+
+    @staticmethod
+    def _roi_mask(shape: Tuple[int, int]) -> np.ndarray:
+        """Build a mask for the gameplay region (excludes HUD and joystick)."""
+
+        h, w = shape[:2]
+        top, bottom, left, right = config.GAMEPLAY_ROI
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[int(h * top) : int(h * bottom), int(w * left) : int(w * right)] = 255
+        return mask
+
+    def detect(
+        self,
+        frame: np.ndarray,
+        include_classes: Optional[Iterable[str]] = None,
+        use_roi: bool = True,
+    ) -> List[Detection]:
+        """Detect all configured object classes in a BGR game-canvas frame."""
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+        if use_roi:
+            mask = self._roi_mask(gray.shape)
+            gray = cv2.bitwise_and(gray, mask)
+
         requested = (
             list(include_classes)
             if include_classes is not None
@@ -204,4 +271,4 @@ class CalibratedDetector:
             raw["missile"] = self._reject_cloud_overlaps(missiles, clouds)
 
         merged = [det for cls, items in raw.items() for det in items if cls in requested]
-        return self._nms(merged)
+        return self._cap_per_class(self._nms(merged))

@@ -83,12 +83,37 @@ class Track:
 class Tracker:
     """Associate detections with existing tracks using Hungarian matching."""
 
-    def __init__(self) -> None:
+    def __init__(self, game_height: Optional[int] = None) -> None:
         self.tracks: Dict[int, Track] = {}
         self._next_id = 1
+        # Canvas height (px) in the same coordinate space as detections. Used to
+        # reject "player" tracks that appear implausibly high on screen.
+        self.game_height: Optional[int] = game_height
+
+    def configure(self, game_height: int) -> None:
+        """Set the canvas height so player validation can use a real bound."""
+
+        if game_height and game_height > 0:
+            self.game_height = int(game_height)
+
+    def _is_valid_player(self, track: Track) -> bool:
+        """A real player sits in the lower part of the canvas and is fresh."""
+
+        if not track.is_alive or track.cls != "player":
+            return False
+        if self.game_height:
+            min_y = self.game_height * config.PLAYER_MIN_Y_FRACTION
+            if track.y < min_y:
+                return False
+        return True
 
     def _get_player_track(self) -> Optional[Track]:
-        players = [t for t in self.tracks.values() if t.cls == "player" and t.is_alive]
+        players = [t for t in self.tracks.values() if self._is_valid_player(t)]
+        if not players and self.game_height is None:
+            # Only before the canvas height is known do we accept any live
+            # player track; once known, spatial validation is authoritative so
+            # false positives high on screen are rejected.
+            players = [t for t in self.tracks.values() if t.cls == "player" and t.is_alive]
         if not players:
             return None
         return max(players, key=lambda t: (t.confidence, t.hits))
